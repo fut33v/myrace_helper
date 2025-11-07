@@ -196,24 +196,66 @@ def derive_overrides(
 
 
 def click_select_all_slots(form) -> None:
+    driver = getattr(form, "_parent", None)
+
+    def _safe_click(element) -> bool:
+        try:
+            element.click()
+            return True
+        except Exception:
+            if driver:
+                try:
+                    driver.execute_script("arguments[0].click();", element)
+                    return True
+                except Exception:  # pylint: disable=broad-except
+                    return False
+            return False
+
     # Попробовать кнопки "Все"
+    button_selectors = [
+        ".slot-select-all",
+        "[data-slot-select-all]",
+        "[data-slot-select='all']",
+        "button[data-select='all']",
+    ]
+    clicked = False
     try:
         button = form.find_element(
-            By.XPATH, ".//button[contains(translate(normalize-space(.), 'ВСЕ', 'все'), 'все')]"
+            By.XPATH, ".//*[self::button or self::span][contains(translate(normalize-space(.), 'ВСЕ', 'все'), 'все')]"
         )
         if button.is_displayed():
-            button.click()
-            return
+            clicked = _safe_click(button)
     except NoSuchElementException:
         pass
+    if not clicked:
+        for selector in button_selectors:
+            elements = form.find_elements(By.CSS_SELECTOR, selector)
+            for element in elements:
+                if _safe_click(element):
+                    clicked = True
+                    break
+            if clicked:
+                break
+
     # Попробовать чекбоксы
-    checkboxes = form.find_elements(By.CSS_SELECTOR, "input[type='checkbox']")
+    checkboxes = form.find_elements(
+        By.CSS_SELECTOR,
+        "input[type='checkbox'][name*='slot'], div.slots input[type='checkbox'], label.slot-item input[type='checkbox']",
+    )
+    missed_labels: List[str] = []
     for checkbox in checkboxes:
-        if not checkbox.is_selected():
-            try:
-                checkbox.click()
-            except Exception:  # pylint: disable=broad-except
-                continue
+        if checkbox.is_selected():
+            continue
+        label_text = ""
+        try:
+            label = checkbox.find_element(By.XPATH, "./ancestor::label[1]")
+            label_text = label.text.strip()
+        except Exception:  # pylint: disable=broad-except
+            label_text = checkbox.get_attribute("value") or ""
+        if not _safe_click(checkbox):
+            missed_labels.append(label_text or "неизвестный слот")
+    if missed_labels:
+        logger.warning("Не удалось выбрать следующие слоты: %s", ", ".join(missed_labels))
 
 
 def maybe_pause(step_delay: float, label: str) -> None:
