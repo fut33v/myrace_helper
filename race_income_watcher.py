@@ -22,7 +22,7 @@ from race_metrics import RaceMetrics, fetch_race_metrics, format_money
 LOGGER = logging.getLogger("race_income_watcher")
 
 DEFAULT_INTERVAL = 300  # seconds
-DEFAULT_COOKIES = "myrace_cookies.txt"
+DEFAULT_COOKIES = "cookies/myrace_cookies.txt"
 DEFAULT_STATE_PATH = "data/race_income_state.json"
 
 

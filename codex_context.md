@@ -28,12 +28,12 @@ MyRace Helper
 - `telegram_bot.py` — Telegram-бот (python-telegram-bot) с командами `/promo`, `/promo100`, `/setcookies`, `/races`, `/setrace`, `/addrace`.
 - `convert_cookies.py` — конвертация браузерных cookies в формат Netscape.
 - Запуск: `run_bot.sh`, `run_bot_local.sh`, `docker-entrypoint.sh`, `Dockerfile`.
-- Конфигурация: `.env`, `requirements.txt`, `myrace_cookies.txt`, `races.json` (генерируется ботом).
+- Конфигурация: `.env`, `requirements.txt`, `cookies/myrace_cookies.txt`, `races.json` (генерируется ботом).
 
 ## Ключевые структуры данных
 - `FormField` / `FormInfo` (`myrace_login.py`) — описание HTML-формы (имена полей, значения, обязательность, варианты выбора) для дальнейшего автозаполнения.
 - `TYPE_SLUGS` (`create_promo_codes.py`) — карта читаемых названий типов промокодов к slug’ам, управляющим маршрутом (например, `distance`).
-- Netscape-cookie файл (`myrace_cookies.txt`) — источник авторизации и общий контракт между CLI/ботом и Selenium.
+- Netscape-cookie файл (`cookies/myrace_cookies.txt`) — источник авторизации и общий контракт между CLI/ботом и Selenium.
 - Список гонок (`races.json`) — вручную/автоматически собранные пары `<id, title>` для выбора гонки ботом.
 
 ## Архитектура

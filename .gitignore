@@ -18,7 +18,8 @@ __pycache__/
 *.log
 
 ### Project Files ###
-myrace_cookies.txt
+cookies/
+!cookies/.gitkeep
 cookies_browser.json
 *.html
 

@@ -15,7 +15,7 @@
    Скрипт либо инициирует отправку письма со ссылкой, либо (при новой схеме) попросит ввести пароль и одноразовый код.
    Если файл `myrace_credentials.json` лежит рядом со скриптом, поля `email` и `password` из него подставятся автоматически.
    Код подтверждения можно передать заранее через `--otp` или ввести вручную по запросу.
-3. После завершения входа проверка по умолчанию попробует открыть страницу купонов для забега `1440`. Куки сохраняются в файл `myrace_cookies.txt`.
+3. После завершения входа проверка по умолчанию попробует открыть страницу купонов для забега `1440`. Куки сохраняются в файл `cookies/myrace_cookies.txt`.
 
 Дополнительные флаги см. через `python3 myrace_login.py -h`.
 
@@ -63,7 +63,7 @@
 2. Сохраните результат в файл `cookies_browser.json`.
 3. Выполните:
    ```bash
-   python3 convert_cookies.py --input cookies_browser.json --output myrace_cookies.txt
+   python3 convert_cookies.py --input cookies_browser.json --output cookies/myrace_cookies.txt
    ```
 4. Запустите основной скрипт с флагом `--reuse-session`, чтобы работать с этими cookie без повторной авторизации.
 
@@ -87,7 +87,7 @@
      --race-id 1440 --coupon-type "Скидка 100%" --field code=BLACKFRIDAY --field discount=100
    ```
    Если требуется код подтверждения, скрипт попросит ввести его в консоли либо примет через `--otp`.
-4. Добавьте `--headless`, чтобы запустить браузер без GUI, и `--save-cookies`, чтобы сохранить обновлённую сессию обратно в `myrace_cookies.txt`.
+4. Добавьте `--headless`, чтобы запустить браузер без GUI, и `--save-cookies`, чтобы сохранить обновлённую сессию обратно в `cookies/myrace_cookies.txt`.
 
 ## Пакетное создание промокодов
 
@@ -120,7 +120,7 @@ docker build -t myrace-helper .
 
 ```bash
 docker run --rm -it \
-  -v "$(pwd)/myrace_cookies.txt:/app/myrace_cookies.txt" \
+  -v "$(pwd)/cookies:/app/cookies" \
   myrace-helper \
   python3 create_promo_codes.py \
     --coupon-type "На определенную дистанцию" \
@@ -145,10 +145,10 @@ docker run --rm -it \
 ./run_bot.sh
 ```
 
-По умолчанию используется `.env` (для `TELEGRAM_BOT_TOKEN` и других переменных), а также файл `myrace_cookies.txt`, который пробрасывается в контейнер. Можно переопределить:
+По умолчанию используется `.env` (для `TELEGRAM_BOT_TOKEN` и других переменных), а также каталог `cookies` с файлом `myrace_cookies.txt`, который пробрасывается в контейнер. Можно переопределить:
 
 ```bash
-ENV_FILE=prod.env COOKIES_FILE=cookies_prod.txt ./run_bot.sh --extra-arg
+ENV_FILE=prod.env COOKIES_DIR=prod_cookies ./run_bot.sh --extra-arg
 ```
 
 Все дополнительные аргументы после скрипта передаются `telegram_bot.py`.
@@ -161,7 +161,7 @@ ENV_FILE=prod.env COOKIES_FILE=cookies_prod.txt ./run_bot.sh --extra-arg
 
 1. Создайте бота через `@BotFather`, получите токен и выставьте переменную окружения `TELEGRAM_BOT_TOKEN`.
 2. Бот работает только с готовым файлом cookies (без логина/пароля). Укажите:
-- `MYRACE_COOKIES_PATH` — путь к файлу cookies (по умолчанию `myrace_cookies.txt`).
+- `MYRACE_COOKIES_PATH` — путь к файлу cookies (по умолчанию `cookies/myrace_cookies.txt`).
 - `MYRACE_RACE_ID` (по умолчанию `1440`) и `MYRACE_COUPON_TYPE` (можно указать несколько вариантов через `|`, например `На определенную дистанцию|At a certain distance`).
 - `MYRACE_SLOT_VALUE`, `MYRACE_USAGE_LIMIT`, `MYRACE_STEP_DELAY` для дополнительных настроек.
 - `TELEGRAM_ADMIN_IDS` — список ID пользователей через запятую. Только эти пользователи могут запускать команды создания промокодов.
@@ -228,7 +228,7 @@ python3 race_income_watcher.py
 - `bot` — Telegram-бот (`telegram_bot.py`).
 - `scheduler` — монитор дохода (`race_income_watcher.py`).
 
-Для корректной работы создайте `.env` с токеном/ID админов и заранее подготовьте `myrace_cookies.txt` (можно пустой `touch myrace_cookies.txt`). Каталог `data/` монтируется внутрь контейнера, поэтому в нём будут храниться `race_income_state.json`, собранные гонки и прочие артефакты.
+Для корректной работы создайте `.env` с токеном/ID админов и заранее подготовьте каталог `cookies` вместе с файлом `myrace_cookies.txt` (например, `mkdir -p cookies && touch cookies/myrace_cookies.txt`). Каталоги `cookies/` и `data/` монтируются внутрь контейнера, поэтому в них будут храниться cookies, `race_income_state.json`, собранные гонки и прочие артефакты.
 
 Запуск:
 

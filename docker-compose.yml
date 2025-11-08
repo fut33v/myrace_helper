@@ -4,7 +4,7 @@ x-service-base: &service-base
   env_file:
     - .env
   volumes:
-    - ./myrace_cookies.txt:/app/myrace_cookies.txt:ro
+    - ./cookies:/app/cookies
     - ./data:/app/data
   restart: unless-stopped
 

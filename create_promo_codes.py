@@ -58,8 +58,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--cookies",
-        default="myrace_cookies.txt",
-        help="Файл cookies в формате Netscape (по умолчанию myrace_cookies.txt).",
+        default="cookies/myrace_cookies.txt",
+        help="Файл cookies в формате Netscape (по умолчанию cookies/myrace_cookies.txt).",
     )
     parser.add_argument(
         "--save-cookies",

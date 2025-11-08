@@ -50,7 +50,7 @@ DEFAULT_SLOT_VALUE = os.getenv("MYRACE_SLOT_VALUE", "all")
 DEFAULT_USAGE_LIMIT = int(os.getenv("MYRACE_USAGE_LIMIT", "1"))
 DEFAULT_STEP_DELAY = os.getenv("MYRACE_STEP_DELAY")
 
-COOKIES_PATH = os.getenv("MYRACE_COOKIES_PATH", "myrace_cookies.txt")
+COOKIES_PATH = os.getenv("MYRACE_COOKIES_PATH", "cookies/myrace_cookies.txt")
 RACES_STORE_PATH = Path(os.getenv("MYRACE_RACES_PATH", "races.json"))
 MAX_RACE_BUTTONS = int(os.getenv("MYRACE_RACE_BUTTONS", "12"))
 MAX_PROMO_PAGES = int(os.getenv("MYRACE_MAX_PAGES", "30"))
@@ -305,6 +305,25 @@ def _build_metrics_session() -> requests.Session:
 def _fetch_income_metrics_sync(race_id: str) -> RaceMetrics:
     session = _build_metrics_session()
     return fetch_race_metrics(session, race_id)
+
+
+def _ensure_cookies_file() -> None:
+    path = Path(COOKIES_PATH)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning("Не удалось создать каталог для cookies %s: %s", path.parent, exc)
+    if path.exists():
+        if path.is_dir():
+            raise RuntimeError(
+                f"Путь {path} является каталогом. Удалите папку и создайте файл cookies с таким именем."
+            )
+        return
+    try:
+        path.touch()
+        logger.info("Создан пустой файл cookies по пути %s", path)
+    except OSError as exc:
+        logger.error("Не удалось создать файл cookies %s: %s", path, exc)
 
 
 def _parse_goal_amount(value: str) -> Decimal:
@@ -1589,19 +1608,34 @@ async def getcookies(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def ingest_cookies(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if context.user_data.get(WIZARD_STATE_KEY):
+        logger.debug("ingest_cookies: wizard state active, ignoring message.")
         return
+    logger.debug("ingest_cookies: handler triggered.")
     pending = context.user_data.get(SETCOOKIE_PENDING_KEY)
-    if not pending or not update.message or (update.message.text or "").startswith("/"):
+    has_message = bool(update.message)
+    starts_with_slash = bool(update.message and (update.message.text or "").startswith("/"))
+    if pending:
+        logger.info(
+            "ingest_cookies: candidate text received (has_message=%s, starts_with_slash=%s)",
+            has_message,
+            starts_with_slash,
+        )
+    if not pending or not has_message or starts_with_slash:
+        if pending:
+            logger.info("ingest_cookies: pending reset due to invalid message.")
         return
 
     json_text = update.message.text.strip()
     if not json_text:
+        logger.debug("ingest_cookies: empty payload after strip.")
         return
 
     try:
         data = json.loads(json_text)
+        logger.debug("ingest_cookies: parsed JSON successfully, type=%s", type(data).__name__)
     except json.JSONDecodeError as exc:
         await update.message.reply_text(f"❌ Не удалось разобрать JSON: {exc}")
+        logger.warning("ingest_cookies: JSON decode error: %s", exc)
         return
     if isinstance(data, dict) and "cookies" in data:
         cookies = data["cookies"]
@@ -1609,16 +1643,32 @@ async def ingest_cookies(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         cookies = data
     else:
         await update.message.reply_text("⚠️ Ожидался массив объектов cookie.")
+        logger.warning("ingest_cookies: JSON has unexpected structure.")
         return
     if not isinstance(cookies, list):
         await update.message.reply_text("⚠️ Поле cookies должно быть массивом.")
+        logger.warning("ingest_cookies: cookies field is not a list.")
         return
     lines = _cookies_to_netscape(cookies)
     if len(lines) <= 2:
         await update.message.reply_text("⚠️ Не удалось получить ни одного cookie.")
+        logger.warning("ingest_cookies: converted netscape list is empty.")
         return
     cookies_path = Path(COOKIES_PATH)
-    cookies_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    if cookies_path.exists() and cookies_path.is_dir():
+        await update.message.reply_text(
+            f"⚠️ Путь {cookies_path} указывает на каталог. Удалите папку и создайте файл (например, `touch {cookies_path.name}`)."
+        )
+        logger.warning("ingest_cookies: %s is a directory.", cookies_path)
+        return
+    cookies_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        cookies_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except OSError as exc:
+        await update.message.reply_text(f"❌ Не удалось сохранить cookies: {exc}")
+        logger.error("ingest_cookies: failed to write file %s: %s", cookies_path, exc)
+        return
+    logger.info("ingest_cookies: saved %s cookie entries to %s", len(lines) - 2, cookies_path)
     await update.message.reply_text(f"✅ Cookies сохранены в {cookies_path}.")
     context.user_data.pop(SETCOOKIE_PENDING_KEY, None)
 
@@ -1630,6 +1680,7 @@ def main() -> None:
     if not SCRIPT_PATH.exists():
         print(f"Не найден create_promo_codes.py по пути {SCRIPT_PATH}", file=sys.stderr)
         sys.exit(1)
+    _ensure_cookies_file()
 
     application: Application = ApplicationBuilder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
@@ -1649,8 +1700,12 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(promo_wizard_callback, pattern=r"^wizard:"))
     application.add_handler(CallbackQueryHandler(handle_income_callback, pattern=r"^income:"))
     application.add_handler(CallbackQueryHandler(handle_race_callback, pattern=r"^race:"))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, promo_wizard_text))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ingest_cookies))
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, promo_wizard_text), group=0
+    )
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, ingest_cookies), group=1
+    )
 
     logger.info("Bot started")
     application.run_polling()
