@@ -11,8 +11,11 @@ import re
 import shlex
 import sys
 import time
+# pylint: disable=too-many-lines
+
 from html import escape
 from dataclasses import dataclass
+from decimal import Decimal
 from http.cookiejar import MozillaCookieJar
 from pathlib import Path
 from typing import Callable, Iterable, List, Optional, Tuple
@@ -25,6 +28,17 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (Application, ApplicationBuilder, CallbackQueryHandler,
                           CommandHandler, ContextTypes, MessageHandler, filters)
+
+from income_goals import get_income_goals_path, load_income_goals, upsert_income_goal
+from race_metrics import RaceMetrics, fetch_race_metrics, format_money
+
+try:  # Work around python-telegram-bot 20.x bug on Python 3.13
+    from telegram.ext._updater import Updater as _PTBUpdater  # type: ignore
+
+    if hasattr(_PTBUpdater, "__slots__") and "__polling_cleanup_cb" not in _PTBUpdater.__slots__:
+        _PTBUpdater.__slots__ = tuple(_PTBUpdater.__slots__) + ("__polling_cleanup_cb",)
+except Exception:  # pragma: no cover
+    pass
 
 BASE_DIR = Path(__file__).resolve().parent
 SCRIPT_PATH = BASE_DIR / "create_promo_codes.py"
@@ -71,8 +85,28 @@ logging.basicConfig(level=_log_level)
 logger = logging.getLogger(__name__)
 logger.setLevel(_log_level)
 
+WIZARD_STATE_KEY = "promo_wizard_state"
+WIZARD_DATA_KEY = "promo_wizard_data"
+INCOME_GOALS_PATH = get_income_goals_path()
+GOAL_CLEAR_KEYWORDS = {"clear", "remove", "reset", "delete", "off", "none"}
 
-def _build_command(code: str, discount: int, usage_limit: int, race_id: str) -> List[str]:
+STATE_CODE = "await_code"
+STATE_SELECT_DISCOUNT = "select_discount"
+STATE_SELECT_LIMIT = "select_limit"
+STATE_SELECT_SLOT = "select_slot"
+STATE_CUSTOM_DISCOUNT = "await_custom_discount"
+STATE_CUSTOM_LIMIT = "await_custom_limit"
+STATE_CUSTOM_SLOT = "await_custom_slot"
+STATE_SUMMARY = "summary"
+
+
+def _build_command(
+    code: str,
+    discount: int,
+    usage_limit: int,
+    race_id: str,
+    slot_value: Optional[str] = None,
+) -> List[str]:
     cmd: List[str] = [
         sys.executable,
         str(SCRIPT_PATH),
@@ -83,7 +117,7 @@ def _build_command(code: str, discount: int, usage_limit: int, race_id: str) -> 
         "--usage-limit",
         str(usage_limit),
         "--slot-value",
-        DEFAULT_SLOT_VALUE,
+        slot_value or DEFAULT_SLOT_VALUE,
         "--coupon-type",
         COUPON_TYPE,
         "--race-id",
@@ -121,24 +155,31 @@ async def _handle_create(
     code: str,
     discount: int,
     usage_limit: int,
+    slot_value: Optional[str] = None,
 ) -> None:
     user = update.effective_user
     user_id = user.id if user else None
     if ADMIN_IDS and user_id not in ADMIN_IDS:
-        await update.message.reply_text("⛔️ пошел на хуй пидарас")
+        message = update.effective_message
+        if message:
+            await message.reply_text("⛔️ пошел на хуй пидарас")
         logger.warning("User %s attempted to create promo without permissions", user_id)
         return
     cookies_file = Path(COOKIES_PATH)
     if not cookies_file.exists():
-        await update.message.reply_text(
-            "⚠️ Cookie-файл не найден. Сначала выполните /setcookies с актуальными данными."
-        )
+        message = update.effective_message
+        if message:
+            await message.reply_text(
+                "⚠️ Cookie-файл не найден. Сначала выполните /setcookies с актуальными данными."
+            )
         return
-    await update.message.reply_text(
-        f"⏳ Создаю промокод {code} (скидка {discount}%, ограничение {usage_limit})…"
-    )
+    message = update.effective_message
+    if message:
+        await message.reply_text(
+            f"⏳ Создаю промокод {code} (скидка {discount}%, ограничение {usage_limit})…"
+        )
     race_id = _current_race_id(context)
-    cmd = _build_command(code, discount, usage_limit, race_id)
+    cmd = _build_command(code, discount, usage_limit, race_id, slot_value=slot_value)
     logger.info("Executing: %s", " ".join(shlex.quote(part) for part in cmd))
     returncode, stdout, stderr = await _run_command(cmd)
 
@@ -153,20 +194,24 @@ async def _handle_create(
                 filtered.append(line)
         if actual_code:
             if filtered:
-                await update.message.reply_text("\n".join(filtered))
+                if message:
+                    await message.reply_text("\n".join(filtered))
             from html import escape as _html_escape
-            await update.message.reply_text(
-                f"🎉 Промокод создан: <code>{_html_escape(actual_code)}</code>",
-                parse_mode=ParseMode.HTML,
-            )
+            if message:
+                await message.reply_text(
+                    f"🎉 Промокод создан: <code>{_html_escape(actual_code)}</code>",
+                    parse_mode=ParseMode.HTML,
+                )
         else:
             message = "\n".join(filtered) if filtered else "✅ Готово."
-            await update.message.reply_text(message)
+            if update.effective_message:
+                await update.effective_message.reply_text(message)
     else:
         combined = (stderr.strip() or stdout.strip() or "Неизвестная ошибка")
-        await update.message.reply_text(
-            f"❌ Ошибка при создании промокода {code} (exit {returncode}):\n{combined}"
-        )
+        if message:
+            await message.reply_text(
+                f"❌ Ошибка при создании промокода {code} (exit {returncode}):\n{combined}"
+            )
 
 
 def _parse_args(args: List[str], expected: int, optional: int = 0) -> Optional[List[str]]:
@@ -181,6 +226,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "📋 Команды:\n"
         "• /promo100 <код> [лимит] — скидка 100%, лимит по умолчанию 1.\n"
         "• /promo <код> <скидка> [лимит] — произвольные значения.\n"
+        "• /promowizard — интерактивное создание промокода с подсказками.\n"
         "• /checkpromos — показать промокоды с оставшимся лимитом.\n"
         f"🍪 Используются cookies из {COOKIES_PATH}. Тип по умолчанию: {COUPON_TYPE}."
     )
@@ -205,9 +251,9 @@ async def promo100(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def promo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    args = _parse_args(context.args, expected=2, optional=1)
+    args = _parse_args(context.args, expected=2, optional=2)
     if args is None:
-        await update.message.reply_text("ℹ️ Использование: /promo <код> <скидка> [лимит]")
+        await update.message.reply_text("ℹ️ Использование: /promo <код> <скидка> [лимит] [слоты]")
         return
     code = args[0]
     try:
@@ -216,13 +262,23 @@ async def promo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("⚠️ Скидка должна быть числом.")
         return
     usage_limit = DEFAULT_USAGE_LIMIT
-    if len(args) == 3:
+    slot_value = None
+    if len(args) >= 3:
         try:
             usage_limit = max(1, int(args[2]))
         except ValueError:
             await update.message.reply_text("⚠️ Лимит должен быть числом.")
             return
-    await _handle_create(update, context, code, discount=discount, usage_limit=usage_limit)
+    if len(args) == 4:
+        slot_value = args[3]
+    await _handle_create(
+        update,
+        context,
+        code,
+        discount=discount,
+        usage_limit=usage_limit,
+        slot_value=slot_value,
+    )
 
 
 def _load_cookies() -> MozillaCookieJar:
@@ -232,6 +288,33 @@ def _load_cookies() -> MozillaCookieJar:
     jar = MozillaCookieJar(str(jar_path))
     jar.load(ignore_discard=True, ignore_expires=True)
     return jar
+
+
+def _build_metrics_session() -> requests.Session:
+    session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) MyRaceHelperBot/1.0",
+            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        }
+    )
+    session.cookies = _load_cookies()
+    return session
+
+
+def _fetch_income_metrics_sync(race_id: str) -> RaceMetrics:
+    session = _build_metrics_session()
+    return fetch_race_metrics(session, race_id)
+
+
+def _parse_goal_amount(value: str) -> Decimal:
+    normalized = value.replace(" ", "").replace("_", "").replace(",", ".")
+    if not normalized:
+        raise ValueError("Пустое значение цели.")
+    amount = Decimal(normalized)
+    if amount < 0:
+        raise ValueError("Цель не может быть отрицательной.")
+    return amount
 
 
 def _fetch_races() -> List[Tuple[str, str]]:
@@ -321,6 +404,48 @@ def _format_races_response(
     return "\n".join(lines), markup
 
 
+def _format_income_keyboard(
+    races_list: List[Tuple[str, str]],
+    current: str,
+) -> Tuple[str, Optional[InlineKeyboardMarkup]]:
+    lines = [
+        "💰 Выберите гонку, чтобы получить текущий доход и количество участников.",
+        "Можно нажимать кнопки несколько раз для разных гонок.",
+    ]
+    buttons: List[List[InlineKeyboardButton]] = []
+    row: List[InlineKeyboardButton] = []
+    for race_id, title in races_list[:MAX_RACE_BUTTONS]:
+        prefix = "⭐️" if race_id == current else "🏁"
+        display = title if len(title) <= 20 else f"{title[:17]}…"
+        label = f"{prefix} {race_id} · {display}"
+        row.append(InlineKeyboardButton(label, callback_data=f"income:{race_id}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    markup = InlineKeyboardMarkup(buttons) if buttons else None
+    return "\n".join(lines), markup
+
+
+def _format_income_response(metrics: RaceMetrics, goal: Optional[Decimal] = None) -> str:
+    title = escape(metrics.title)
+    lines = [
+        f"🏁 <b>{title}</b> (ID {metrics.race_id})",
+        f"👥 Участников: <b>{metrics.participants}</b>",
+        f"💰 Доход: <b>{format_money(metrics.revenue)} ₽</b>",
+    ]
+    if goal is not None:
+        target_text = format_money(goal)
+        remaining = goal - metrics.revenue
+        if remaining > 0:
+            remaining_text = format_money(remaining)
+            lines.append(f"🎯 Цель: {target_text} ₽ (осталось {remaining_text} ₽)")
+        else:
+            lines.append(f"🎯 Цель: {target_text} ₽ достигнута или превышена!")
+    return "\n".join(lines)
+
+
 async def races(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         races_list = await asyncio.to_thread(_fetch_races)
@@ -336,6 +461,136 @@ async def races(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.chat_data["races_last_list"] = races_list
     text, markup = _format_races_response(races_list, current)
     await update.message.reply_text(text, reply_markup=markup)
+
+
+async def income(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    user_id = user.id if user else None
+    message = update.effective_message
+    if ADMIN_IDS and user_id not in ADMIN_IDS:
+        if message:
+            await message.reply_text("⛔️ пошел на хуй пидарас")
+        logger.warning("User %s attempted to read income without permissions", user_id)
+        return
+
+    try:
+        races_list = await asyncio.to_thread(_fetch_races)
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.exception("Не удалось загрузить гонки для income: %s", exc)
+        if message:
+            await message.reply_text("⚠️ Не удалось загрузить список гонок, попробуйте позже.")
+        return
+
+    if not races_list:
+        if message:
+            await message.reply_text("⚠️ Список гонок пуст. Добавьте гонки через /addrace или /races.")
+        return
+
+    context.chat_data["income_last_races"] = races_list
+    text, markup = _format_income_keyboard(races_list, _current_race_id(context))
+    if message:
+        await message.reply_text(text, reply_markup=markup)
+
+
+async def goal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    user_id = user.id if user else None
+    message = update.effective_message
+    if ADMIN_IDS and user_id not in ADMIN_IDS:
+        if message:
+            await message.reply_text("⛔️ пошел на хуй пидарас")
+        logger.warning("User %s attempted to modify goals without permissions", user_id)
+        return
+
+    args = context.args or []
+    current_race = _current_race_id(context)
+
+    if not args:
+        goals = await asyncio.to_thread(load_income_goals, INCOME_GOALS_PATH)
+        goal_value = goals.get(current_race)
+        lines = []
+        if goal_value is None:
+            lines.append(
+                f"🎯 Для гонки {current_race} цель не задана. "
+                "Используйте /goal <сумма> или /goal <race_id> <сумма>."
+            )
+        else:
+            lines.append(
+                f"🎯 Цель для гонки {current_race}: {format_money(goal_value)} ₽."
+            )
+        if goals:
+            lines.append("")
+            lines.append("Текущие цели:")
+            for race_id, amount in list(goals.items())[:20]:
+                lines.append(f"• {race_id}: {format_money(amount)} ₽")
+            if len(goals) > 20:
+                lines.append("…")
+        if message:
+            await message.reply_text("\n".join(lines))
+        return
+
+    tokens = [part.strip() for part in args if part.strip()]
+    if not tokens:
+        if message:
+            await message.reply_text("⚠️ Укажите сумму цели.")
+        return
+
+    if len(tokens) == 1 or not tokens[0].isdigit():
+        race_id = current_race
+        target_value = " ".join(tokens)
+    else:
+        race_id = tokens[0]
+        target_value = " ".join(tokens[1:]).strip()
+
+    if not race_id:
+        if message:
+            await message.reply_text("⚠️ Укажите ID гонки.")
+        return
+    if not target_value:
+        if message:
+            await message.reply_text("⚠️ Укажите сумму цели.")
+        return
+
+    normalized = target_value.strip().lower()
+    if normalized in GOAL_CLEAR_KEYWORDS:
+        await asyncio.to_thread(upsert_income_goal, race_id, None, INCOME_GOALS_PATH)
+        text = f"🗑 Цель по доходу для гонки {race_id} удалена."
+    else:
+        try:
+            amount = _parse_goal_amount(target_value)
+        except Exception as exc:  # pylint: disable=broad-except
+            if message:
+                await message.reply_text(f"⚠️ Некорректная сумма цели: {exc}")
+            return
+        await asyncio.to_thread(upsert_income_goal, race_id, amount, INCOME_GOALS_PATH)
+        text = f"🎯 Цель для гонки {race_id} установлена: {format_money(amount)} ₽."
+
+    if message:
+        await message.reply_text(text)
+
+
+async def handle_income_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.data or not query.data.startswith("income:"):
+        return
+    await query.answer()
+    race_id = query.data.split(":", 1)[1]
+    parse_mode = None
+    try:
+        metrics = await asyncio.to_thread(_fetch_income_metrics_sync, race_id)
+        goals = await asyncio.to_thread(load_income_goals, INCOME_GOALS_PATH)
+        goal_value = goals.get(race_id)
+    except FileNotFoundError:
+        text = "⚠️ Cookie-файл не найден. Сначала загрузите cookies через /setcookies."
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.exception("Не удалось получить доход по гонке %s: %s", race_id, exc)
+        text = f"⚠️ Не удалось получить данные для гонки {race_id}: {exc}"
+    else:
+        text = _format_income_response(metrics, goal_value)
+        parse_mode = ParseMode.HTML
+
+    if query.message:
+        await query.message.reply_text(text, parse_mode=parse_mode)
 
 
 async def handle_race_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -602,6 +857,249 @@ async def checkpromos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
     await _set_progress(f"✅ Готово! Доступных промокодов: {total_codes}")
+
+
+def _wizard_active(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    return WIZARD_DATA_KEY in context.user_data
+
+
+def _wizard_data(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    data = context.user_data.get(WIZARD_DATA_KEY)
+    if data is None:
+        data = {}
+        context.user_data[WIZARD_DATA_KEY] = data
+    return data
+
+
+def _wizard_clear(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop(WIZARD_DATA_KEY, None)
+    context.user_data.pop(WIZARD_STATE_KEY, None)
+
+
+async def promo_wizard_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    user_id = user.id if user else None
+    if ADMIN_IDS and user_id not in ADMIN_IDS:
+        await update.message.reply_text("⛔️ пошел на хуй пидарас")
+        logger.warning("User %s attempted to run promo wizard without permissions", user_id)
+        return
+    if not Path(COOKIES_PATH).exists():
+        await update.message.reply_text(
+            "⚠️ Cookie-файл не найден. Сначала выполните /setcookies с актуальными данными."
+        )
+        return
+    _wizard_clear(context)
+    data = _wizard_data(context)
+    data.update(
+        {
+            "code": None,
+            "discount": 100,
+            "usage_limit": DEFAULT_USAGE_LIMIT,
+            "slot_value": DEFAULT_SLOT_VALUE,
+        }
+    )
+    context.user_data[WIZARD_STATE_KEY] = STATE_CODE
+    await update.message.reply_text(
+        "Введите код промокода (например, TIPACYCLO8). В любой момент можно отправить /cancelpromo."
+    )
+
+
+async def promo_wizard_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _wizard_active(context):
+        await update.message.reply_text("Мастер промокодов не запущен.")
+        return
+    _wizard_clear(context)
+    await update.message.reply_text("Мастер промокодов сброшен.")
+
+
+async def _wizard_prompt_discount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data[WIZARD_STATE_KEY] = STATE_SELECT_DISCOUNT
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("100%", callback_data="wizard:discount:100"),
+                InlineKeyboardButton("70%", callback_data="wizard:discount:70"),
+                InlineKeyboardButton("50%", callback_data="wizard:discount:50"),
+            ],
+            [InlineKeyboardButton("Другое значение", callback_data="wizard:discount:custom")],
+        ]
+    )
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="Выберите скидку:",
+        reply_markup=keyboard,
+    )
+
+
+async def _wizard_prompt_limit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data[WIZARD_STATE_KEY] = STATE_SELECT_LIMIT
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("1", callback_data="wizard:limit:1"),
+                InlineKeyboardButton("5", callback_data="wizard:limit:5"),
+                InlineKeyboardButton("10", callback_data="wizard:limit:10"),
+            ],
+            [InlineKeyboardButton("Другое значение", callback_data="wizard:limit:custom")],
+        ]
+    )
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="Выберите максимальное число использований:",
+        reply_markup=keyboard,
+    )
+
+
+async def _wizard_prompt_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data[WIZARD_STATE_KEY] = STATE_SELECT_SLOT
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Все слоты", callback_data="wizard:slot:all"),
+            ],
+            [
+                InlineKeyboardButton(
+                    f"По умолчанию ({DEFAULT_SLOT_VALUE})",
+                    callback_data=f"wizard:slot:{DEFAULT_SLOT_VALUE}",
+                )
+            ],
+            [InlineKeyboardButton("Ввести вручную", callback_data="wizard:slot:custom")],
+        ]
+    )
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="Выберите слоты:",
+        reply_markup=keyboard,
+    )
+
+
+def _wizard_summary_text(data: dict) -> str:
+    lines = [
+        "Готово к созданию:",
+        f"Код: {data.get('code')}",
+        f"Скидка: {data.get('discount')}%",
+        f"Лимит: {data.get('usage_limit')} использований",
+        f"Слоты: {data.get('slot_value')}",
+    ]
+    return "\n".join(lines)
+
+
+async def _wizard_show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data[WIZARD_STATE_KEY] = STATE_SUMMARY
+    data = _wizard_data(context)
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Создать", callback_data="wizard:create")],
+            [InlineKeyboardButton("Отмена", callback_data="wizard:cancel")],
+        ]
+    )
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=_wizard_summary_text(data),
+        reply_markup=keyboard,
+    )
+
+
+async def promo_wizard_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    state = context.user_data.get(WIZARD_STATE_KEY)
+    if not state:
+        return
+    data = context.user_data.get(WIZARD_DATA_KEY)
+    if not data:
+        _wizard_clear(context)
+        return
+    text = (update.message.text or "").strip()
+    if state == STATE_CODE:
+        if not text:
+            await update.message.reply_text("Код не может быть пустым.")
+            return
+        data["code"] = text
+        await update.message.reply_text(f"Код сохранён: {text}")
+        await _wizard_prompt_discount(update, context)
+    elif state == STATE_CUSTOM_DISCOUNT:
+        try:
+            value = int(text)
+        except ValueError:
+            await update.message.reply_text("Введите целое число скидки.")
+            return
+        data["discount"] = value
+        await update.message.reply_text(f"Скидка установлена: {value}%")
+        await _wizard_prompt_limit(update, context)
+    elif state == STATE_CUSTOM_LIMIT:
+        try:
+            value = max(1, int(text))
+        except ValueError:
+            await update.message.reply_text("Введите целое число лимита.")
+            return
+        data["usage_limit"] = value
+        await update.message.reply_text(f"Лимит установен: {value}")
+        await _wizard_prompt_slot(update, context)
+    elif state == STATE_CUSTOM_SLOT:
+        if not text:
+            await update.message.reply_text("Значение слотов не может быть пустым.")
+            return
+        data["slot_value"] = text
+        await update.message.reply_text(f"Слоты: {text}")
+        await _wizard_show_summary(update, context)
+    else:
+        await update.message.reply_text("Ожидаю ответ через кнопки.")
+
+
+async def promo_wizard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query:
+        return
+    data = context.user_data.get(WIZARD_DATA_KEY)
+    if not data:
+        await query.answer("Активного мастера нет.")
+        return
+    parts = (query.data or "").split(":")
+    if len(parts) < 2 or parts[0] != "wizard":
+        await query.answer()
+        return
+    action = parts[1]
+    await query.answer()
+    if action == "discount":
+        if len(parts) >= 3 and parts[2] != "custom":
+            data["discount"] = int(parts[2])
+            await query.message.reply_text(f"Скидка: {data['discount']}%")
+            await _wizard_prompt_limit(update, context)
+        else:
+            context.user_data[WIZARD_STATE_KEY] = STATE_CUSTOM_DISCOUNT
+            await query.message.reply_text("Введите скидку числом:")
+    elif action == "limit":
+        if len(parts) >= 3 and parts[2] != "custom":
+            data["usage_limit"] = max(1, int(parts[2]))
+            await query.message.reply_text(f"Лимит: {data['usage_limit']}")
+            await _wizard_prompt_slot(update, context)
+        else:
+            context.user_data[WIZARD_STATE_KEY] = STATE_CUSTOM_LIMIT
+            await query.message.reply_text("Введите лимит числом:")
+    elif action == "slot":
+        if len(parts) >= 3 and parts[2] != "custom":
+            data["slot_value"] = parts[2]
+            await query.message.reply_text(f"Слоты: {data['slot_value']}")
+            await _wizard_show_summary(update, context)
+        else:
+            context.user_data[WIZARD_STATE_KEY] = STATE_CUSTOM_SLOT
+            await query.message.reply_text("Введите значение слотов (как в интерфейсе):")
+    elif action == "create":
+        if not data.get("code"):
+            await query.message.reply_text("Код не указан.")
+            return
+        await query.message.reply_text("🚀 Запускаю создание промокода…")
+        await _handle_create(
+            update,
+            context,
+            data["code"],
+            data["discount"],
+            data["usage_limit"],
+            slot_value=data.get("slot_value"),
+        )
+        _wizard_clear(context)
+    elif action == "cancel":
+        _wizard_clear(context)
+        await query.message.reply_text("Мастер промокодов отменён.")
 
 
 def _cookies_to_netscape(cookies: Iterable[dict]) -> List[str]:
@@ -1056,7 +1554,42 @@ async def setcookies(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
+async def getcookies(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    user_id = user.id if user else None
+    if ADMIN_IDS and user_id not in ADMIN_IDS:
+        await update.message.reply_text("⛔️ пошел на хуй пидарас")
+        logger.warning("User %s attempted to read cookies without permissions", user_id)
+        return
+    path = Path(COOKIES_PATH)
+    if not path.exists():
+        await update.message.reply_text(f"⚠️ Cookie-файл {COOKIES_PATH} не найден.")
+        return
+    try:
+        with path.open("rb") as handle:
+            await update.message.reply_document(
+                document=handle,
+                filename=path.name,
+                caption=f"Текущие cookies из {path.name}",
+            )
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning("Не удалось отправить файл cookies: %s", exc)
+        try:
+            content = path.read_text(encoding="utf-8")
+        except Exception as inner_exc:  # pylint: disable=broad-except
+            await update.message.reply_text(f"❌ Не удалось прочитать файл cookies: {inner_exc}")
+            return
+        if len(content) > 3500:
+            content = content[:3500] + "\n… (обрезано)"
+        await update.message.reply_text(
+            f"```\n{content}\n```",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+
+
 async def ingest_cookies(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if context.user_data.get(WIZARD_STATE_KEY):
+        return
     pending = context.user_data.get(SETCOOKIE_PENDING_KEY)
     if not pending or not update.message or (update.message.text or "").startswith("/"):
         return
@@ -1102,13 +1635,21 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("promo100", promo100))
     application.add_handler(CommandHandler("promo", promo))
+    application.add_handler(CommandHandler("promowizard", promo_wizard_start))
+    application.add_handler(CommandHandler("cancelpromo", promo_wizard_cancel))
     application.add_handler(CommandHandler("races", races))
+    application.add_handler(CommandHandler("income", income))
+    application.add_handler(CommandHandler("goal", goal))
     application.add_handler(CommandHandler("setrace", setrace))
     application.add_handler(CommandHandler("addrace", add_race))
     application.add_handler(CommandHandler("checkpromos", checkpromos))
     application.add_handler(CommandHandler("setcookies", setcookies))
+    application.add_handler(CommandHandler("getcookies", getcookies))
     application.add_handler(CommandHandler("cancelcookies", start))
+    application.add_handler(CallbackQueryHandler(promo_wizard_callback, pattern=r"^wizard:"))
+    application.add_handler(CallbackQueryHandler(handle_income_callback, pattern=r"^income:"))
     application.add_handler(CallbackQueryHandler(handle_race_callback, pattern=r"^race:"))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, promo_wizard_text))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ingest_cookies))
 
     logger.info("Bot started")

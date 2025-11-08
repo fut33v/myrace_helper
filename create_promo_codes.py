@@ -11,6 +11,12 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Union
 
 logger = logging.getLogger("create_promo")
+handler = logging.StreamHandler()
+formatter = logging.Formatter("%(asctime)s %(levelname)s:%(name)s:%(message)s")
+handler.setFormatter(formatter)
+if not logger.handlers:
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
 
 from bs4 import BeautifulSoup  # type: ignore
 from selenium.common.exceptions import NoSuchElementException, TimeoutException  # type: ignore
@@ -30,6 +36,7 @@ from myrace_selenium import (  # type: ignore
 )
 
 SLOTS_FORM_URL = "https://myrace.info/promo/races/{race_id}/slots/new"
+COUPON_LIST_URL = "https://myrace.info/race/coupons/list/{race_id}"
 
 TYPE_SLUGS = {
     "на определенную дистанцию": "distance",
@@ -200,63 +207,37 @@ def click_select_all_slots(form) -> None:
 
     def _safe_click(element) -> bool:
         try:
+            if driver:
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
             element.click()
+            logger.debug("Clicked element %s", element)
             return True
         except Exception:
             if driver:
                 try:
                     driver.execute_script("arguments[0].click();", element)
+                    logger.debug("Clicked element via JS %s", element)
                     return True
-                except Exception:  # pylint: disable=broad-except
+                except Exception:  # pylint: disable-broad-except
                     return False
             return False
 
-    # Попробовать кнопки "Все"
-    button_selectors = [
-        ".slot-select-all",
-        "[data-slot-select-all]",
-        "[data-slot-select='all']",
-        "button[data-select='all']",
-    ]
-    clicked = False
     try:
-        button = form.find_element(
-            By.XPATH, ".//*[self::button or self::span][contains(translate(normalize-space(.), 'ВСЕ', 'все'), 'все')]"
-        )
-        if button.is_displayed():
-            clicked = _safe_click(button)
+        master_checkbox = form.find_element(By.ID, "chkAll")
     except NoSuchElementException:
-        pass
-    if not clicked:
-        for selector in button_selectors:
-            elements = form.find_elements(By.CSS_SELECTOR, selector)
-            for element in elements:
-                if _safe_click(element):
-                    clicked = True
-                    break
-            if clicked:
-                break
-
-    # Попробовать чекбоксы
-    checkboxes = form.find_elements(
-        By.CSS_SELECTOR,
-        "input[type='checkbox'][name*='slot'], div.slots input[type='checkbox'], label.slot-item input[type='checkbox']",
-    )
-    missed_labels: List[str] = []
-    for checkbox in checkboxes:
-        if checkbox.is_selected():
-            continue
-        label_text = ""
         try:
-            label = checkbox.find_element(By.XPATH, "./ancestor::label[1]")
-            label_text = label.text.strip()
-        except Exception:  # pylint: disable=broad-except
-            label_text = checkbox.get_attribute("value") or ""
-        if not _safe_click(checkbox):
-            missed_labels.append(label_text or "неизвестный слот")
-    if missed_labels:
-        logger.warning("Не удалось выбрать следующие слоты: %s", ", ".join(missed_labels))
+            master_checkbox = form.find_element(By.CSS_SELECTOR, "input#chkAll")
+        except NoSuchElementException:
+            logger.error("Не найден чекбокс #chkAll для выбора всех слотов.")
+            return
 
+    if master_checkbox.is_selected():
+        logger.info("#chkAll уже выбран.")
+        return
+
+    logger.info("Выбираем все слоты через чекбокс #chkAll.")
+    if not _safe_click(master_checkbox):
+        logger.error("Не удалось кликнуть по #chkAll. Проверьте вёрстку.")
 
 def maybe_pause(step_delay: float, label: str) -> None:
     if step_delay > 0:
@@ -269,10 +250,6 @@ def ensure_authorized(driver) -> None:
     if "/login" in current:
         raise RuntimeError(
             "Cookies недействительны (редирект на страницу входа). Обновите их через /setcookies."
-        )
-    if "/events/" in current:
-        raise RuntimeError(
-            "Cookies ведут на публичную страницу события. Обновите их через /setcookies."
         )
 
 
@@ -301,6 +278,7 @@ def open_slots_form(
             coupon_type_query,
         )
     logger.info("Открываем форму по адресу %s", target)
+    logger.info("Step: opening slots form %s", target)
     driver.get(target)
     try:
         wait.until(lambda d: d.current_url.startswith(target) or "/login" not in d.current_url)
@@ -309,13 +287,41 @@ def open_slots_form(
     current_url = driver.current_url
     logger.info("Текущий URL после загрузки: %s", current_url)
 
-    if "/events/" in current_url:
-        logger.info("Попали на страницу события, пробуем повторно открыть форму.")
+    if any(fragment in current_url for fragment in ("/events/", "/race/list")):
+        logger.info(
+            "Похоже, нас перенаправили на %s. Переходим через список промокодов %s.",
+            current_url,
+            list_url,
+        )
+        logger.info("Step: redirected; opening %s", list_url)
+        driver.get(list_url)
+        ensure_authorized(driver)
+        try:
+            wait.until(lambda d: "/coupons/list" in d.current_url or "/login" not in d.current_url)
+        except TimeoutException:
+            logger.warning("Таймаут ожидания при загрузке %s", list_url)
+        logger.info("Step: retrying slots form %s", target)
         driver.get(target)
         current_url = driver.current_url
         logger.info("URL после повторного открытия: %s", current_url)
 
     ensure_authorized(driver)
+    base_target = target.split("#")[0]
+    if base_target.rstrip("/") not in current_url:
+        logger.info(
+            "Не удалось оказаться на странице формы (%s). Пробуем открыть её в новой вкладке.",
+            target,
+        )
+        logger.info("Step: opening slots form in new tab %s", target)
+        driver.execute_script("window.open(arguments[0], '_blank');", target)
+        driver.switch_to.window(driver.window_handles[-1])
+        try:
+            wait.until(lambda d: "/promo/races" in d.current_url or "/login" not in d.current_url)
+        except TimeoutException:
+            logger.warning("Новая вкладка с %s не загрузилась вовремя.", target)
+        current_url = driver.current_url
+        logger.info("URL после открытия новой вкладки: %s", current_url)
+        ensure_authorized(driver)
     if "/coupon/races/" in current_url and "/types" in current_url:
         logger.warning(
             "Сервер вернул страницу '/types'. Проверьте корректность slug и cookies."
@@ -444,7 +450,7 @@ def main() -> None:
     wait = WebDriverWait(driver, args.wait)
 
     logger = logging.getLogger("create_promo")
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)
     if not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO)
 

@@ -1,0 +1,18 @@
+x-service-base: &service-base
+  build:
+    context: .
+  env_file:
+    - .env
+  volumes:
+    - ./myrace_cookies.txt:/app/myrace_cookies.txt:ro
+    - ./data:/app/data
+  restart: unless-stopped
+
+services:
+  bot:
+    <<: *service-base
+    command: ["python3", "telegram_bot.py"]
+
+  scheduler:
+    <<: *service-base
+    command: ["python3", "race_income_watcher.py"]

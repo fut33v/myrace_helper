@@ -21,3 +21,5 @@ __pycache__/
 myrace_cookies.txt
 cookies_browser.json
 *.html
+
+data/
